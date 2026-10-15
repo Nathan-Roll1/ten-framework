@@ -64,7 +64,7 @@ def download_model(
     for name, expected in FILE_HASHES.items():
         digest = hashlib.sha256()
         with (directory / name).open("rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            while chunk := file.read(1024 * 1024):
                 digest.update(chunk)
         if digest.hexdigest() != expected:
             raise ValueError(

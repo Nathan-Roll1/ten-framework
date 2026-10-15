@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -18,7 +18,7 @@ class OrukRealtimeASRConfig(BaseModel):
     dump: bool = False
     dump_path: str = "."
 
-    params: dict[str, Any] = Field(default_factory=dict)
+    params: Annotated[dict[str, Any], Field(default_factory=dict)]
 
     @property
     def api_key(self) -> str:

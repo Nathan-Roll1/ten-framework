@@ -42,9 +42,7 @@ class _TurnCallback:
     def __getattr__(self, name):
         async def dispatch(*args, **kwargs):
             target = self.extension
-            if self.generation != target._generation or target.stopped:
-                return
-            if target._fatal and name not in {"on_close"}:
+            if not target.accepts_callback(self.generation, name):
                 return
             await getattr(target, name)(*args, **kwargs)
 
@@ -62,6 +60,13 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     Phrase-emotion estimates describe vocal expression only; they are not
     verified assessments of a person's internal state.
     """
+
+    def accepts_callback(self, generation: int, event: str) -> bool:
+        return (
+            generation == self._generation
+            and not self.stopped
+            and (not self._fatal or event == "on_close")
+        )
 
     def __init__(self, name: str):
         super().__init__(name)
