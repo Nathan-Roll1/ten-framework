@@ -317,6 +317,14 @@ class Transport(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(e._closing)
         session.close.assert_awaited_once()
 
+    async def test_committed_turn_reports_disconnected_for_buffering(self):
+        e = self.new()
+        e._ready = True
+        e._socket = Mock(closed=False)
+        self.assertTrue(e.is_connected())
+        e._committed = True
+        self.assertFalse(e.is_connected())
+
     async def test_committed_turn_rejects_audio(self):
         e = self.new()
         e._committed = True
