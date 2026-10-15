@@ -89,7 +89,10 @@ class OrukRealtimeConnection:
 
     def is_connected(self) -> bool:
         return (
-            self._ready and self._socket is not None and not self._socket.closed
+            self._ready
+            and not self._committed
+            and self._socket is not None
+            and not self._socket.closed
         )
 
     def _session_options(self) -> dict[str, Any]:
