@@ -118,15 +118,15 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
                 )
                 self.audio_dumper = Dumper(dump_file_path)
                 await self.audio_dumper.start()
-        except Exception as e:
-            ten_env.log_error(f"Invalid Oruk realtime config: {e}")
+        except Exception:
+            ten_env.log_error("Invalid Oruk ASR configuration")
             self._init_failed = True
             self.config = OrukRealtimeASRConfig.model_validate_json("{}")
             await self.send_asr_error(
                 ModuleError(
                     module=MODULE_NAME_ASR,
                     code=ModuleErrorCode.FATAL_ERROR.value,
-                    message=str(e),
+                    message="Invalid Oruk ASR configuration",
                 ),
             )
 

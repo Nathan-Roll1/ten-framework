@@ -195,6 +195,17 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(results[1].metadata["session_id"], "session-a")
 
+    async def test_invalid_config_never_echoes_credential_values(self):
+        e = self.new()
+        env = Mock()
+        secret = "DO_NOT_LOG_THIS_CREDENTIAL"
+        env.get_property_to_json = AsyncMock(
+            return_value=('{"params":"' + secret + '"}', None)
+        )
+        await e.on_init(env)
+        self.assertNotIn(secret, e.send_asr_error.await_args.args[0].message)
+        self.assertNotIn(secret, str(env.log_error.call_args))
+
     async def test_invalid_config_latches(self):
         e = self.new()
         env = Mock()
