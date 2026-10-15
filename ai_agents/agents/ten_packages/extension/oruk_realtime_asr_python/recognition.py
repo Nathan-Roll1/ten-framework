@@ -40,7 +40,12 @@ def validate_endpoint(endpoint: str) -> None:
     """Require secure WebSockets, credential-free URLs and model-only query."""
     parsed = urlsplit(endpoint)
     local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-    if parsed.username or parsed.password or parsed.fragment or not parsed.hostname:
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.fragment
+        or not parsed.hostname
+    ):
         raise ValueError("endpoint must not contain credentials or a fragment")
     if parsed.scheme != "wss" and not (parsed.scheme == "ws" and local):
         raise ValueError(
@@ -80,12 +85,11 @@ class OrukRealtimeConnection:
         self._ready = False
         self._committed = False
         self._request_id: str = ""
+        self._closing = False
 
     def is_connected(self) -> bool:
         return (
-            self._ready
-            and self._socket is not None
-            and not self._socket.closed
+            self._ready and self._socket is not None and not self._socket.closed
         )
 
     def _session_options(self) -> dict[str, Any]:
@@ -100,36 +104,49 @@ class OrukRealtimeConnection:
             "diarize": self._diarize,
         }
 
-    async def start(self, *, request_id: str, connect_timeout: float = 10.0) -> None:
+    async def start(
+        self, *, request_id: str, connect_timeout: float = 10.0
+    ) -> None:
         validate_endpoint(self._url)
         if not self._api_key or any(c.isspace() for c in self._api_key):
-            raise ValueError("Provide a nonempty Oruk API key without whitespace")
+            raise ValueError(
+                "Provide a nonempty Oruk API key without whitespace"
+            )
 
         self._request_id = request_id
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None)
         )
-        async with asyncio.timeout(connect_timeout):
-            self._socket = await self._session.ws_connect(
-                self._url,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "X-Request-ID": request_id,
-                },
-                protocols=[_SUBPROTOCOL],
-                heartbeat=15,
-                max_msg_size=1_048_576,
-            )
-            created = await self._receive_json()
-            if created is None or created.get("type") != "session.created":
-                raise RuntimeError("missing session.created")
-            self._request_id = created.get("request_id", request_id) or request_id
-            await self._socket.send_json(
-                {"type": "session.update", "session": self._session_options()}
-            )
-            updated = await self._receive_json()
-            if updated is None or updated.get("type") != "session.updated":
-                raise RuntimeError("missing session.updated")
+        try:
+            async with asyncio.timeout(connect_timeout):
+                self._socket = await self._session.ws_connect(
+                    self._url,
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "X-Request-ID": request_id,
+                    },
+                    protocols=[_SUBPROTOCOL],
+                    heartbeat=15,
+                    max_msg_size=1_048_576,
+                )
+                created = await self._receive_json()
+                if created is None or created.get("type") != "session.created":
+                    raise RuntimeError("missing session.created")
+                self._request_id = (
+                    created.get("request_id", request_id) or request_id
+                )
+                await self._socket.send_json(
+                    {
+                        "type": "session.update",
+                        "session": self._session_options(),
+                    }
+                )
+                updated = await self._receive_json()
+                if updated is None or updated.get("type") != "session.updated":
+                    raise RuntimeError("missing session.updated")
+        except BaseException:
+            await self.close()
+            raise
 
         self._ready = True
         self._receiver = asyncio.create_task(self._receive_loop())
@@ -137,7 +154,7 @@ class OrukRealtimeConnection:
 
     async def send_pcm(self, pcm: bytes) -> None:
         if not self.is_connected() or self._committed:
-            return
+            raise ConnectionError("Oruk turn is not accepting audio")
         for offset in range(0, len(pcm), _CHUNK_BYTES):
             await self._socket.send_bytes(pcm[offset : offset + _CHUNK_BYTES])
 
@@ -158,28 +175,38 @@ class OrukRealtimeConnection:
         if message.type != aiohttp.WSMsgType.TEXT:
             raise RuntimeError("unexpected non-text websocket message")
         event = json.loads(message.data)
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+        if not isinstance(event, dict) or not isinstance(
+            event.get("type"), str
+        ):
             raise RuntimeError("invalid event")
         return event
 
     async def _receive_loop(self) -> None:
+        code, message = 1000, "closed"
         try:
             while True:
                 event = await self._receive_json()
                 if event is None:
-                    code = (
-                        self._socket.close_code
-                        if self._socket is not None
-                        else 1000
-                    )
-                    await self._callback.on_close(code or 1000, "closed")
-                    return
+                    code = self._socket.close_code or 1000
+                    break
                 await self._dispatch(event)
+                if self._closing:
+                    break
         except asyncio.CancelledError:
             return
-        except Exception as e:  # noqa: BLE001 - surface as a vendor error
-            await self._callback.on_error(str(e), None, fatal=False)
-            await self._callback.on_close(0, "receive loop error")
+        except Exception:
+            code, message = 0, "receive loop error"
+            await self._callback.on_error(
+                message, "receive_failed", fatal=False
+            )
+        finally:
+            self._ready = False
+            if self._socket is not None and not self._socket.closed:
+                await self._socket.close()
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            if not self._closing:
+                await self._callback.on_close(code, message)
 
     async def _dispatch(self, event: dict[str, Any]) -> None:
         kind = event["type"]
@@ -218,7 +245,11 @@ class OrukRealtimeConnection:
 
     async def close(self) -> None:
         self._ready = False
-        if self._receiver is not None:
+        self._closing = True
+        if (
+            self._receiver is not None
+            and self._receiver is not asyncio.current_task()
+        ):
             self._receiver.cancel()
             try:
                 await self._receiver

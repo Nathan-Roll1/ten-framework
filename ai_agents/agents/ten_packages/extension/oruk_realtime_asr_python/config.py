@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .const import DEFAULT_URL, SAMPLE_RATE
+from .recognition import validate_endpoint
 
 
 class OrukRealtimeASRConfig(BaseModel):
@@ -59,6 +60,7 @@ class OrukRealtimeASRConfig(BaseModel):
         return "" if self.language == "auto" else self.language
 
     def validate_config(self) -> None:
+        validate_endpoint(self.url)
         if not self.api_key:
             raise ValueError(
                 "oruk_realtime_asr_python requires an Oruk API key "
@@ -79,7 +81,9 @@ class OrukRealtimeASRConfig(BaseModel):
                 if params.get(name):
                     value = str(params[name])
                     params[name] = (
-                        value[:2] + "***" + value[-2:] if len(value) > 6 else "***"
+                        value[:2] + "***" + value[-2:]
+                        if len(value) > 6
+                        else "***"
                     )
             data["params"] = params
         return json.dumps(data)

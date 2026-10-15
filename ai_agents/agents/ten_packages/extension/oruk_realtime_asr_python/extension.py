@@ -31,6 +31,25 @@ from .const import DUMP_FILE_NAME, MODEL, MODULE_NAME_ASR, SAMPLE_RATE
 from .recognition import OrukRealtimeConnection, OrukRealtimeCallback
 
 
+class _TurnCallback:
+    """Ignore late events from a socket replaced by a later turn."""
+
+    def __init__(self, extension, generation):
+        self.extension = extension
+        self.generation = generation
+
+    def __getattr__(self, name):
+        async def dispatch(*args, **kwargs):
+            target = self.extension
+            if self.generation != target._generation or target.stopped:
+                return
+            if target._fatal and name not in {"on_close"}:
+                return
+            await getattr(target, name)(*args, **kwargs)
+
+        return dispatch
+
+
 class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     """Oruk realtime (streaming WebSocket) ASR for TEN.
 
@@ -49,6 +68,16 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
         self.connection: OrukRealtimeConnection | None = None
         self.audio_dumper: Dumper | None = None
         self._reconnect_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
+        self._io_lock = asyncio.Lock()
+        self._finalize_lock = asyncio.Lock()
+        self._reconnect_task = None
+        self._generation = 0
+        self._fatal = False
+        self._init_failed = False
+        self._finalize_pending = False
+        self._turn_done = asyncio.Event()
+        self._connect_started = 0.0
         # Per-turn state.
         self._phrases: list[dict[str, Any]] = []
         self._final_sent = False
@@ -84,11 +113,14 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
                 category=LOG_CATEGORY_KEY_POINT,
             )
             if self.config.dump:
-                dump_file_path = os.path.join(self.config.dump_path, DUMP_FILE_NAME)
+                dump_file_path = os.path.join(
+                    self.config.dump_path, DUMP_FILE_NAME
+                )
                 self.audio_dumper = Dumper(dump_file_path)
                 await self.audio_dumper.start()
         except Exception as e:
             ten_env.log_error(f"Invalid Oruk realtime config: {e}")
+            self._init_failed = True
             self.config = OrukRealtimeASRConfig.model_validate_json("{}")
             await self.send_asr_error(
                 ModuleError(
@@ -100,6 +132,7 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
 
     @override
     async def on_deinit(self, ten_env: AsyncTenEnv) -> None:
+        await self.stop_connection()
         await super().on_deinit(ten_env)
         if self.audio_dumper:
             await self.audio_dumper.stop()
@@ -107,64 +140,82 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
 
     @override
     async def start_connection(self) -> None:
-        """Open one realtime turn. The base emits CONNECTING before this runs."""
-        assert self.config is not None
-        if not self.config.api_key:
-            error = ModuleError(
-                module=MODULE_NAME_ASR,
-                code=ModuleErrorCode.FATAL_ERROR.value,
-                message="Oruk API key is required but missing or empty",
-            )
-            await self.send_asr_error(error)
-            await self.on_disconnected(code=error.code, message=error.message)
+        if self._init_failed or self._fatal or self.stopped:
             return
-
-        if self.connection is not None:
-            await self.stop_connection()
-
-        self._reset_turn()
-        self.connection = OrukRealtimeConnection(
-            api_key=self.config.api_key,
-            url=self.config.url,
-            language=self.config.language,
-            phrase_emotions=self.config.phrase_emotions,
-            diarize=self.config.diarize,
-            sample_rate=self.config.sample_rate,
-            callback=self,
-            ten_env=self.ten_env,
-        )
-        try:
-            await self.connection.start(request_id=self.uuid)
-        except Exception as e:
-            self.ten_env.log_error(f"Failed to connect to Oruk realtime: {e}")
-            self.connection = None
-            vendor_info = ModuleErrorVendorInfo(
-                vendor=self.vendor(), code="connect_failed", message=str(e)
+        async with self._connect_lock:
+            if self.is_connected():
+                return
+            assert self.config is not None
+            await self._close_current()
+            self._generation += 1
+            generation = self._generation
+            self._reset_turn()
+            self._turn_done.clear()
+            self._connect_started = asyncio.get_running_loop().time()
+            connection = OrukRealtimeConnection(
+                api_key=self.config.api_key,
+                url=self.config.url,
+                language=self.config.language,
+                phrase_emotions=self.config.phrase_emotions,
+                diarize=self.config.diarize,
+                sample_rate=self.config.sample_rate,
+                callback=_TurnCallback(self, generation),
+                ten_env=self.ten_env,
             )
-            await self.send_asr_error(
-                ModuleError(
-                    module=MODULE_NAME_ASR,
-                    code=ModuleErrorCode.NON_FATAL_ERROR.value,
-                    message=str(e),
-                ),
-                vendor_info,
-            )
-            await self.on_disconnected(
-                code=ModuleErrorCode.NON_FATAL_ERROR.value,
-                message=str(e),
-                vendor_info=vendor_info,
-            )
+            self.connection = connection
+            try:
+                await connection.start(request_id=self.uuid)
+                if self.stopped or generation != self._generation:
+                    await connection.close()
+                    if self.connection is connection:
+                        self.connection = None
+            except asyncio.CancelledError:
+                await connection.close()
+                if self.connection is connection:
+                    self.connection = None
+                raise
+            except Exception as exc:
+                await connection.close()
+                if self.connection is connection:
+                    self.connection = None
+                if self.stopped or generation != self._generation:
+                    return
+                status = getattr(exc, "status", None)
+                await self.on_error(
+                    "Oruk connection failed",
+                    str(status or "connect_failed"),
+                    status in {401, 403},
+                )
+                await self.on_disconnected(code=0, message="connect failed")
+                self._schedule_reconnect()
 
     @override
     def is_connected(self) -> bool:
-        return self.connection is not None and self.connection.is_connected()
+        return (
+            not self._fatal
+            and not self.stopped
+            and self.connection is not None
+            and self.connection.is_connected()
+        )
+
+    async def _close_current(self) -> None:
+        self._generation += 1
+        async with self._io_lock:
+            connection, self.connection = self.connection, None
+        if connection is not None:
+            await connection.close()
 
     @override
     async def stop_connection(self) -> None:
-        if self.connection is not None:
-            connection = self.connection
-            self.connection = None
-            await connection.close()
+        task, self._reconnect_task = self._reconnect_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._close_current()
+        await self._finish_finalize()
 
     @override
     def input_audio_sample_rate(self) -> int:
@@ -177,28 +228,55 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
         return ASRBufferConfigModeKeep(byte_limit=1024 * 1024 * 10)
 
     @override
-    async def send_audio(self, frame: AudioFrame, _session_id: str | None) -> bool:
-        if self.connection is None:
-            return False
-        buf = frame.lock_buf()
-        try:
-            audio_data = bytes(buf)
-            if self.audio_dumper:
-                await self.audio_dumper.push_bytes(audio_data)
-            await self.connection.send_pcm(audio_data)
-            self._turn_bytes += len(audio_data)
-            return True
-        except Exception as e:
-            self.ten_env.log_error(f"Error sending audio to Oruk realtime: {e}")
-            return False
-        finally:
-            frame.unlock_buf(buf)
+    async def send_audio(
+        self, frame: AudioFrame, _session_id: str | None
+    ) -> bool:
+        async with self._io_lock:
+            connection = self.connection
+            if connection is None or not connection.is_connected():
+                return False
+            buf = frame.lock_buf()
+            try:
+                audio_data = bytes(buf)
+                await connection.send_pcm(audio_data)
+                self._turn_bytes += len(audio_data)
+                self.audio_timeline.add_user_audio(
+                    len(audio_data) / 2 / self.config.sample_rate * 1000
+                )
+                if self.audio_dumper:
+                    await self.audio_dumper.push_bytes(audio_data)
+                return True
+            except Exception:
+                return False
+            finally:
+                frame.unlock_buf(buf)
 
     @override
     async def finalize(self, _session_id: str | None) -> None:
-        """Commit the current turn so the server emits the final transcript."""
-        if self.connection is not None:
-            await self.connection.commit()
+        async with self._finalize_lock:
+            self._finalize_pending = True
+            try:
+                async with self._io_lock:
+                    connection = self.connection
+                    if connection is None or not connection.is_connected():
+                        return
+                    await connection.commit()
+                await asyncio.wait_for(self._turn_done.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await self.on_error(
+                    "Oruk finalization timed out", "finalize_timeout", False
+                )
+                await self._close_current()
+                await self.on_disconnected(code=0, message="finalize timeout")
+                self._schedule_reconnect()
+            finally:
+                await self._finish_finalize()
+
+    async def _finish_finalize(self) -> None:
+        self._turn_done.set()
+        if self._finalize_pending:
+            self._finalize_pending = False
+            await self.send_asr_finalize_end()
 
     # ---- Vendor callbacks (OrukRealtimeCallback) ----
 
@@ -208,6 +286,12 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             "Oruk realtime connection opened", category=LOG_CATEGORY_VENDOR
         )
         await self.on_connected()
+        await self.send_connect_delay_metrics(
+            int(
+                (asyncio.get_running_loop().time() - self._connect_started)
+                * 1000
+            )
+        )
 
     @override
     async def on_interim(self, text: str) -> None:
@@ -228,6 +312,9 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
         if self._final_sent:
             return
         self._final_sent = True
+        if not text.strip():
+            await self._finish_finalize()
+            return
         duration_ms = self._turn_duration_ms()
         await self.send_asr_result(
             ASRResult(
@@ -241,7 +328,7 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             )
         )
         self._emitted_ms += duration_ms
-        await self.send_asr_finalize_end()
+        await self._finish_finalize()
 
     @override
     async def on_phrase_emotion(self, event: dict[str, Any]) -> None:
@@ -259,8 +346,10 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     async def on_error(
         self, message: str, code: str | None, fatal: bool
     ) -> None:
+        if fatal:
+            self._fatal = True
         self.ten_env.log_error(
-            f"vendor_error: code={code}, message={message}",
+            f"vendor_error: code={code}",
             category=LOG_CATEGORY_VENDOR,
         )
         vendor_info = ModuleErrorVendorInfo(
@@ -280,26 +369,42 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             ),
             vendor_info,
         )
+        if fatal:
+            await self._close_current()
+            await self._finish_finalize()
+            await self.on_disconnected(code=0, message="fatal vendor error")
 
     @override
     async def on_close(self, code: int, message: str) -> None:
-        self.ten_env.log_info(
-            f"Oruk realtime connection closed: code={code}, message={message}",
-            category=LOG_CATEGORY_VENDOR,
-        )
+        # Transport cleanup precedes callback delivery in the client.
         self.connection = None
+        if not self._final_sent:
+            self._emitted_ms += self._turn_duration_ms()
+        await self._finish_finalize()
         await self.on_disconnected(code=0, message="closed")
-        # The realtime socket commits one turn per connection; reopen for the
-        # next turn unless the extension is shutting down.
-        if not self.stopped:
-            asyncio.create_task(self._reopen())
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self.stopped or self._fatal or self._init_failed:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reopen())
 
     async def _reopen(self) -> None:
         async with self._reconnect_lock:
-            if self.stopped or self.is_connected():
-                return
-            self.ten_env.log_debug("Reopening Oruk realtime connection for next turn")
-            await self.start_connection()
+            for attempt in range(5):
+                if self.stopped or self._fatal or self.is_connected():
+                    return
+                if attempt:
+                    await asyncio.sleep(min(0.5 * 2 ** (attempt - 1), 4.0))
+                await self.start_connection()
+                if self.is_connected():
+                    return
+            if not self.stopped and not self._fatal:
+                await self.on_error(
+                    "Oruk reconnect retry limit reached", "retry_limit", True
+                )
 
     # ---- helpers ----
 

@@ -38,3 +38,10 @@ require a pre-provisioned cache in offline deployments.
 
 Orukeet code is MIT; the model weights and Gabor kernels are CC BY-SA 4.0. See
 the model card at https://huggingface.co/oruk/orukeet.
+
+
+## Lifecycle review follow-up
+
+The review revision latches invalid configuration, preserves the audio timeline across reconnects, ignores replaced-socket callbacks, bounds recovery to five attempts with backoff, closes per-turn HTTP sessions, and completes finalize on disconnect/timeout. Stop cancels and awaits recovery.
+
+Offline fault-injection coverage is in `oruk_realtime_asr_python/tests/unit/test_lifecycle.py` and covers both extensions. Run `python -m unittest discover -s agents/ten_packages/extension/oruk_realtime_asr_python/tests/unit -v` from `ai_agents/`. The tests stub the TEN boundary and exercise actual extension and transport methods. Native runtime/ASR guarders still need the supported Linux development container and are a merge gate; offline success is not a claim of full live acceptance.

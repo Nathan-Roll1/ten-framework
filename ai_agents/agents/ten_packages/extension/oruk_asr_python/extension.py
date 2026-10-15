@@ -48,6 +48,7 @@ class OrukASRExtension(AsyncASRBaseExtension):
         self.recognizer: OrukeetRecognizer | None = None
         self.audio_dumper: Dumper | None = None
         self._connected = False
+        self._init_failed = False
         # Current utterance PCM16 bytes and the stream offset where it began.
         self._utterance = bytearray()
         self._utterance_start_ms = 0
@@ -74,11 +75,14 @@ class OrukASRExtension(AsyncASRBaseExtension):
                 category=LOG_CATEGORY_KEY_POINT,
             )
             if self.config.dump:
-                dump_file_path = os.path.join(self.config.dump_path, DUMP_FILE_NAME)
+                dump_file_path = os.path.join(
+                    self.config.dump_path, DUMP_FILE_NAME
+                )
                 self.audio_dumper = Dumper(dump_file_path)
                 await self.audio_dumper.start()
         except Exception as e:
             ten_env.log_error(f"Invalid Orukeet config: {e}")
+            self._init_failed = True
             self.config = OrukASRConfig.model_validate_json("{}")
             await self.send_asr_error(
                 ModuleError(
@@ -98,6 +102,8 @@ class OrukASRExtension(AsyncASRBaseExtension):
     @override
     async def start_connection(self) -> None:
         """Load the local model once. The base emits CONNECTING before this runs."""
+        if self._init_failed or self.stopped:
+            return
         assert self.config is not None
         self.ten_env.log_info(
             "Loading Orukeet model (CPU, INT8 ONNX)",
@@ -112,7 +118,9 @@ class OrukASRExtension(AsyncASRBaseExtension):
             await asyncio.to_thread(self.recognizer.prewarm)
             self._connected = True
             self._utterance.clear()
-            self._utterance_start_ms = 0
+            self._utterance_start_ms = int(
+                self.audio_timeline.get_total_user_audio_duration()
+            )
             await self.on_connected()
             self.ten_env.log_info(
                 "Orukeet model ready", category=LOG_CATEGORY_VENDOR
@@ -155,13 +163,22 @@ class OrukASRExtension(AsyncASRBaseExtension):
         return ASRBufferConfigModeKeep(byte_limit=1024 * 1024 * 10)
 
     @override
-    async def send_audio(self, frame: AudioFrame, _session_id: str | None) -> bool:
+    async def send_audio(
+        self, frame: AudioFrame, _session_id: str | None
+    ) -> bool:
         buf = frame.lock_buf()
         try:
             audio_data = bytes(buf)
             if self.audio_dumper:
                 await self.audio_dumper.push_bytes(audio_data)
+            if not self._utterance:
+                self._utterance_start_ms = int(
+                    self.audio_timeline.get_total_user_audio_duration()
+                )
             self._utterance.extend(audio_data)
+            self.audio_timeline.add_user_audio(
+                len(audio_data) / 2 / self.config.sample_rate * 1000
+            )
             return True
         except Exception as e:
             self.ten_env.log_error(f"Error buffering audio for Orukeet: {e}")
@@ -188,7 +205,8 @@ class OrukASRExtension(AsyncASRBaseExtension):
         if pcm and self.recognizer is not None:
             try:
                 samples = (
-                    np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                    / 32768.0
                 )
                 text = await asyncio.to_thread(
                     self.recognizer.recognize, samples, sample_rate
