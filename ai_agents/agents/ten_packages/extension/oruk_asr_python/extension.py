@@ -109,6 +109,7 @@ class OrukASRExtension(AsyncASRBaseExtension):
             "Loading Orukeet model (CPU, INT8 ONNX)",
             category=LOG_CATEGORY_VENDOR,
         )
+        began = asyncio.get_running_loop().time()
         try:
             if self.recognizer is None:
                 self.recognizer = OrukeetRecognizer(
@@ -122,6 +123,9 @@ class OrukASRExtension(AsyncASRBaseExtension):
                 self.audio_timeline.get_total_user_audio_duration()
             )
             await self.on_connected()
+            await self.send_connect_delay_metrics(
+                int((asyncio.get_running_loop().time() - began) * 1000)
+            )
             self.ten_env.log_info(
                 "Orukeet model ready", category=LOG_CATEGORY_VENDOR
             )

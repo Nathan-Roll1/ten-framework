@@ -42,15 +42,17 @@ class Base:
         pass
 
 
-for name in [
+_stub_names = [
     "ten_ai_base",
     "ten_ai_base.asr",
     "ten_ai_base.const",
     "ten_ai_base.dumper",
     "ten_ai_base.message",
     "ten_runtime",
-]:
-    sys.modules.setdefault(name, types.ModuleType(name))
+]
+_original_modules = {name: sys.modules.get(name) for name in _stub_names}
+for name in _stub_names:
+    sys.modules[name] = types.ModuleType(name)
 a = sys.modules["ten_ai_base.asr"]
 a.AsyncASRBaseExtension = Base
 for name in ["ASRBufferConfig", "ASRBufferConfigModeKeep", "ASRResult"]:
@@ -69,13 +71,22 @@ m.ModuleErrorCode = Enum(
 )
 sys.modules["ten_runtime"].AsyncTenEnv = object
 sys.modules["ten_runtime"].AudioFrame = object
-for package in ["oruk_realtime_asr_python", "oruk_asr_python"]:
+for package, directory in [
+    ("_oruk_unit_realtime", "oruk_realtime_asr_python"),
+    ("_oruk_unit_local", "oruk_asr_python"),
+]:
     namespace = types.ModuleType(package)
-    namespace.__path__ = [str(ROOT / package)]
+    namespace.__path__ = [str(ROOT / directory)]
     sys.modules[package] = namespace
-rt = importlib.import_module("oruk_realtime_asr_python.extension")
-transport = importlib.import_module("oruk_realtime_asr_python.recognition")
-local = importlib.import_module("oruk_asr_python.extension")
+rt = importlib.import_module("_oruk_unit_realtime.extension")
+transport = importlib.import_module("_oruk_unit_realtime.recognition")
+local = importlib.import_module("_oruk_unit_local.extension")
+
+for name, original in _original_modules.items():
+    if original is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = original
 
 
 class Lifecycle(unittest.IsolatedAsyncioTestCase):
