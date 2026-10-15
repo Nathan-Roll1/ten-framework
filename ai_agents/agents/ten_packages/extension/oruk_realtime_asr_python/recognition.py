@@ -121,32 +121,9 @@ class OrukRealtimeConnection:
             timeout=aiohttp.ClientTimeout(total=None)
         )
         try:
-            async with asyncio.timeout(connect_timeout):
-                self._socket = await self._session.ws_connect(
-                    self._url,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "X-Request-ID": request_id,
-                    },
-                    protocols=[_SUBPROTOCOL],
-                    heartbeat=15,
-                    max_msg_size=1_048_576,
-                )
-                created = await self._receive_json()
-                if created is None or created.get("type") != "session.created":
-                    raise RuntimeError("missing session.created")
-                self._request_id = (
-                    created.get("request_id", request_id) or request_id
-                )
-                await self._socket.send_json(
-                    {
-                        "type": "session.update",
-                        "session": self._session_options(),
-                    }
-                )
-                updated = await self._receive_json()
-                if updated is None or updated.get("type") != "session.updated":
-                    raise RuntimeError("missing session.updated")
+            await asyncio.wait_for(
+                self._handshake(request_id), timeout=connect_timeout
+            )
         except BaseException:
             await self.close()
             raise
@@ -154,6 +131,31 @@ class OrukRealtimeConnection:
         self._ready = True
         self._receiver = asyncio.create_task(self._receive_loop())
         await self._callback.on_open()
+
+    async def _handshake(self, request_id):
+        self._socket = await self._session.ws_connect(
+            self._url,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "X-Request-ID": request_id,
+            },
+            protocols=[_SUBPROTOCOL],
+            heartbeat=15,
+            max_msg_size=1_048_576,
+        )
+        created = await self._receive_json()
+        if created is None or created.get("type") != "session.created":
+            raise RuntimeError("missing session.created")
+        self._request_id = created.get("request_id", request_id) or request_id
+        await self._socket.send_json(
+            {
+                "type": "session.update",
+                "session": self._session_options(),
+            }
+        )
+        updated = await self._receive_json()
+        if updated is None or updated.get("type") != "session.updated":
+            raise RuntimeError("missing session.updated")
 
     async def send_pcm(self, pcm: bytes) -> None:
         if not self.is_connected() or self._committed:

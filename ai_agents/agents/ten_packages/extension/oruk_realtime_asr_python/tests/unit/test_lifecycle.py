@@ -21,6 +21,11 @@ class Base:
         self.stopped = False
         self.uuid = "request-test"
         self.metadata = {"session_id": "session-a"}
+        self.session_id = "session-a"
+        self.buffered_frames = asyncio.Queue()
+        self.buffered_frames_size = 0
+        self.sent_buffer_length = 0
+        self.first_audio_time = None
         self.ten_env = Mock()
         self.audio_timeline = Mock()
         self.audio_timeline.get_total_user_audio_duration.return_value = 700
@@ -257,6 +262,117 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await e.send_audio(f, None))
         f.unlock_buf.assert_called_once()
         e.audio_timeline.add_user_audio.assert_not_called()
+
+    async def test_failed_flush_preserves_audio_in_order(self):
+        e = self.new()
+        e.connection = Mock(
+            is_connected=Mock(return_value=True),
+            send_pcm=AsyncMock(side_effect=OSError()),
+        )
+        frames = [
+            Mock(
+                lock_buf=Mock(return_value=b"\0\0"),
+                get_buf=Mock(return_value=b"\0\0"),
+            )
+            for _ in range(2)
+        ]
+        for f in frames:
+            await e.buffered_frames.put(f)
+        with self.assertRaises(ConnectionError):
+            await e._flush_buffered_audio()
+        self.assertIs(e.buffered_frames.get_nowait(), frames[0])
+        self.assertIs(e.buffered_frames.get_nowait(), frames[1])
+
+    async def test_old_finalize_waiter_does_not_commit_new_turn(self):
+        e = self.new()
+        e.connection = Mock(is_connected=Mock(return_value=False))
+        task = asyncio.create_task(e.finalize(None))
+        await asyncio.sleep(0)
+        e._generation += 1
+        new = Mock(
+            is_connected=Mock(return_value=True),
+            commit=AsyncMock(),
+            close=AsyncMock(),
+        )
+        e.connection = new
+        e._ready_event.set()
+        await task
+        new.commit.assert_not_called()
+        new.close.assert_not_called()
+        e.send_asr_finalize_end.assert_awaited_once()
+
+    async def test_dump_failure_does_not_repeat_accepted_audio(self):
+        e = self.new()
+        e.connection = Mock(
+            is_connected=Mock(return_value=True), send_pcm=AsyncMock()
+        )
+        e.audio_dumper = Mock(push_bytes=AsyncMock(side_effect=OSError()))
+        f = Mock(lock_buf=Mock(return_value=b"\0\0" * 160))
+        self.assertTrue(await e.send_audio(f, None))
+        e.connection.send_pcm.assert_awaited_once()
+        self.assertEqual(e._turn_bytes, 320)
+
+    async def test_metadata_from_buffered_frame_preserved(self):
+        e = self.new()
+        f = Mock(
+            get_property_to_json=Mock(
+                return_value=(
+                    '{"session_id":"buffered-session","request":"r"}',
+                    None,
+                )
+            )
+        )
+        e._capture_metadata(f)
+        self.assertEqual(e.session_id, "buffered-session")
+        self.assertEqual(e._build_metadata()["session_id"], "buffered-session")
+
+    async def test_realtime_open_flushes_before_ready(self):
+        e = self.new()
+        e._flushing = True
+        e.connection = Mock(
+            is_connected=Mock(return_value=True), send_pcm=AsyncMock()
+        )
+        f = Mock(
+            lock_buf=Mock(return_value=b"\0\0" * 160),
+            get_buf=Mock(return_value=b"\0\0" * 160),
+            get_property_to_json=Mock(
+                return_value=('{"session_id":"buffered-session"}', None)
+            ),
+        )
+        await e.buffered_frames.put(f)
+        await e.on_open()
+        e.connection.send_pcm.assert_awaited_once()
+        self.assertTrue(e._ready_event.is_set())
+        self.assertFalse(e._flushing)
+        self.assertEqual(e.session_id, "buffered-session")
+
+    async def test_local_finalize_waits_for_model_and_buffer_flush(self):
+        e = local.OrukASRExtension("test")
+        e.config = types.SimpleNamespace(
+            sample_rate=16000, asr_result_language="en"
+        )
+        e.recognizer = Mock(loaded=True, recognize=Mock(return_value="hello"))
+        e._loading = True
+        f = Mock(
+            lock_buf=Mock(return_value=b"\0\0" * 160),
+            get_buf=Mock(return_value=b"\0\0" * 160),
+            get_property_to_json=Mock(
+                return_value=('{"session_id":"warmup-session"}', None)
+            ),
+        )
+        await e.buffered_frames.put(f)
+        task = asyncio.create_task(e.finalize(None))
+        await asyncio.sleep(0)
+        e.send_asr_result.assert_not_called()
+        await e._flush_buffered_audio()
+        e._loading = False
+        e._ready_event.set()
+        await task
+        self.assertEqual(
+            e.send_asr_result.await_args.args[0].metadata["session_id"],
+            "warmup-session",
+        )
+        e.send_asr_finalize_end.assert_awaited_once()
 
     async def test_local_invalid_config_never_loads_model(self):
         e = local.OrukASRExtension("test")

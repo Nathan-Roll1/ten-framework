@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import os
 from typing import Any, Dict
 
@@ -49,9 +50,58 @@ class OrukASRExtension(AsyncASRBaseExtension):
         self.audio_dumper: Dumper | None = None
         self._connected = False
         self._init_failed = False
+        self._ready_event = asyncio.Event()
+        self._loading = False
+        self._flushing = False
         # Current utterance PCM16 bytes and the stream offset where it began.
         self._utterance = bytearray()
         self._utterance_start_ms = 0
+
+    def _capture_metadata(self, message, session_id=None):
+        try:
+            raw, _ = message.get_property_to_json("metadata")
+            value = json.loads(raw) if raw else None
+            if isinstance(value, dict):
+                self.metadata = copy.deepcopy(value)
+                self.session_id = value.get("session_id", self.session_id)
+            if session_id is not None and self.metadata is None:
+                self.metadata = {"session_id": session_id}
+                self.session_id = session_id
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    @override
+    async def on_audio_frame(self, ten_env, audio_frame):
+        if self.metadata is None:
+            self._capture_metadata(audio_frame)
+        await super().on_audio_frame(ten_env, audio_frame)
+
+    @override
+    async def on_data(self, ten_env, data):
+        if data.get_name() == "asr_finalize":
+            self._capture_metadata(data)
+        await super().on_data(ten_env, data)
+
+    async def _flush_buffered_audio(self):
+        while not self.stopped:
+            try:
+                frame = self.buffered_frames.get_nowait()
+            except asyncio.QueueEmpty:
+                self.buffered_frames_size = 0
+                return
+            if not await self.send_audio(frame, self.session_id):
+                pending = [frame]
+                while not self.buffered_frames.empty():
+                    pending.append(self.buffered_frames.get_nowait())
+                for queued in pending:
+                    self.buffered_frames.put_nowait(queued)
+                self.buffered_frames_size = sum(
+                    len(x.get_buf()) for x in pending
+                )
+                raise ConnectionError("Buffered audio could not be sent")
+            self.sent_buffer_length += len(frame.get_buf())
+            if self.first_audio_time is None:
+                self.first_audio_time = asyncio.get_running_loop().time()
 
     @override
     def vendor(self) -> str:
@@ -109,6 +159,8 @@ class OrukASRExtension(AsyncASRBaseExtension):
             "Loading Orukeet model (CPU, INT8 ONNX)",
             category=LOG_CATEGORY_VENDOR,
         )
+        self._loading = True
+        self._ready_event.clear()
         began = asyncio.get_running_loop().time()
         try:
             if self.recognizer is None:
@@ -117,12 +169,17 @@ class OrukASRExtension(AsyncASRBaseExtension):
                     local_files_only=self.config.local_files_only,
                 )
             await asyncio.to_thread(self.recognizer.prewarm)
+            if self.stopped:
+                return
+            self._flushing = True
             self._connected = True
             self._utterance.clear()
             self._utterance_start_ms = int(
                 self.audio_timeline.get_total_user_audio_duration()
             )
             await self.on_connected()
+            await self._flush_buffered_audio()
+            self._flushing = False
             await self.send_connect_delay_metrics(
                 int((asyncio.get_running_loop().time() - began) * 1000)
             )
@@ -137,18 +194,24 @@ class OrukASRExtension(AsyncASRBaseExtension):
                 message=str(e),
             )
             await self.send_asr_error(error)
+            self._init_failed = True
             await self.on_disconnected(code=error.code, message=error.message)
+        finally:
+            self._loading = False
+            self._ready_event.set()
 
     @override
     def is_connected(self) -> bool:
         return (
             self._connected
+            and not self._flushing
             and self.recognizer is not None
             and self.recognizer.loaded
         )
 
     @override
     async def stop_connection(self) -> None:
+        self._ready_event.set()
         self._connected = False
         self._utterance.clear()
         if self.recognizer is not None:
@@ -170,11 +233,15 @@ class OrukASRExtension(AsyncASRBaseExtension):
     async def send_audio(
         self, frame: AudioFrame, _session_id: str | None
     ) -> bool:
+        self._capture_metadata(frame, _session_id)
         buf = frame.lock_buf()
         try:
             audio_data = bytes(buf)
             if self.audio_dumper:
-                await self.audio_dumper.push_bytes(audio_data)
+                try:
+                    await self.audio_dumper.push_bytes(audio_data)
+                except Exception:
+                    self.ten_env.log_error("Audio diagnostic dump failed")
             if not self._utterance:
                 self._utterance_start_ms = int(
                     self.audio_timeline.get_total_user_audio_duration()
@@ -194,6 +261,15 @@ class OrukASRExtension(AsyncASRBaseExtension):
     async def finalize(self, _session_id: str | None) -> None:
         """Transcribe the buffered utterance and emit a single final result."""
         assert self.config is not None
+        if self._loading and not self.stopped:
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                await self.send_asr_finalize_end()
+                return
+        if self.stopped:
+            await self.send_asr_finalize_end()
+            return
 
         pcm = bytes(self._utterance)
         # Drop a trailing odd byte so int16 framing stays aligned.

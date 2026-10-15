@@ -42,7 +42,10 @@ def download_model(
     required = (*FILE_HASHES, *LICENSE_FILES)
     paths = [
         try_to_load_from_cache(
-            REPO_ID, f"{SUBFOLDER}/{name}", revision=REVISION, cache_dir=cache_dir
+            REPO_ID,
+            f"{SUBFOLDER}/{name}",
+            revision=REVISION,
+            cache_dir=cache_dir,
         )
         for name in required
     ]
@@ -78,7 +81,9 @@ class OrukeetRecognizer:
     extension calls ``prewarm`` and ``recognize`` from a worker thread.
     """
 
-    def __init__(self, *, cache_dir: str | None, local_files_only: bool) -> None:
+    def __init__(
+        self, *, cache_dir: str | None, local_files_only: bool
+    ) -> None:
         self._cache_dir = cache_dir
         self._local_files_only = local_files_only
         self._lock = threading.Lock()

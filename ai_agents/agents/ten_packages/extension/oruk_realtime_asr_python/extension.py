@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import os
 from typing import Any, Dict
 
@@ -78,11 +79,59 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
         self._finalize_pending = False
         self._turn_done = asyncio.Event()
         self._connect_started = 0.0
+        self._ready_event = asyncio.Event()
+        self._flushing = False
         # Per-turn state.
         self._phrases: list[dict[str, Any]] = []
         self._final_sent = False
         self._turn_bytes = 0
         self._emitted_ms = 0
+
+    def _capture_metadata(self, message, session_id=None):
+        try:
+            raw, _ = message.get_property_to_json("metadata")
+            value = json.loads(raw) if raw else None
+            if isinstance(value, dict):
+                self.metadata = copy.deepcopy(value)
+                self.session_id = value.get("session_id", self.session_id)
+            if session_id is not None and self.metadata is None:
+                self.metadata = {"session_id": session_id}
+                self.session_id = session_id
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    @override
+    async def on_audio_frame(self, ten_env, audio_frame):
+        if self.metadata is None:
+            self._capture_metadata(audio_frame)
+        await super().on_audio_frame(ten_env, audio_frame)
+
+    @override
+    async def on_data(self, ten_env, data):
+        if data.get_name() == "asr_finalize":
+            self._capture_metadata(data)
+        await super().on_data(ten_env, data)
+
+    async def _flush_buffered_audio(self):
+        while not self.stopped:
+            try:
+                frame = self.buffered_frames.get_nowait()
+            except asyncio.QueueEmpty:
+                self.buffered_frames_size = 0
+                return
+            if not await self.send_audio(frame, self.session_id):
+                pending = [frame]
+                while not self.buffered_frames.empty():
+                    pending.append(self.buffered_frames.get_nowait())
+                for queued in pending:
+                    self.buffered_frames.put_nowait(queued)
+                self.buffered_frames_size = sum(
+                    len(x.get_buf()) for x in pending
+                )
+                raise ConnectionError("Buffered audio could not be sent")
+            self.sent_buffer_length += len(frame.get_buf())
+            if self.first_audio_time is None:
+                self.first_audio_time = asyncio.get_running_loop().time()
 
     @override
     def vendor(self) -> str:
@@ -150,6 +199,8 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             self._generation += 1
             generation = self._generation
             self._reset_turn()
+            self._ready_event.clear()
+            self._flushing = True
             self._turn_done.clear()
             self._connect_started = asyncio.get_running_loop().time()
             connection = OrukRealtimeConnection(
@@ -193,12 +244,14 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     def is_connected(self) -> bool:
         return (
             not self._fatal
+            and not self._flushing
             and not self.stopped
             and self.connection is not None
             and self.connection.is_connected()
         )
 
     async def _close_current(self) -> None:
+        self._ready_event.set()
         self._generation += 1
         async with self._io_lock:
             connection, self.connection = self.connection, None
@@ -235,6 +288,7 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             connection = self.connection
             if connection is None or not connection.is_connected():
                 return False
+            self._capture_metadata(frame, _session_id)
             buf = frame.lock_buf()
             try:
                 audio_data = bytes(buf)
@@ -244,7 +298,10 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
                     len(audio_data) / 2 / self.config.sample_rate * 1000
                 )
                 if self.audio_dumper:
-                    await self.audio_dumper.push_bytes(audio_data)
+                    try:
+                        await self.audio_dumper.push_bytes(audio_data)
+                    except Exception:
+                        self.ten_env.log_error("Audio diagnostic dump failed")
                 return True
             except Exception:
                 return False
@@ -255,14 +312,27 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     async def finalize(self, _session_id: str | None) -> None:
         async with self._finalize_lock:
             self._finalize_pending = True
+            generation = self._generation
             try:
+                if (
+                    not self.is_connected()
+                    and self.connection is not None
+                    and not self._fatal
+                ):
+                    await asyncio.wait_for(
+                        self._ready_event.wait(), timeout=10.0
+                    )
                 async with self._io_lock:
+                    if generation != self._generation:
+                        return
                     connection = self.connection
                     if connection is None or not connection.is_connected():
                         return
                     await connection.commit()
                 await asyncio.wait_for(self._turn_done.wait(), timeout=10.0)
             except asyncio.TimeoutError:
+                if generation != self._generation:
+                    return
                 await self.on_error(
                     "Oruk finalization timed out", "finalize_timeout", False
                 )
@@ -286,6 +356,9 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
             "Oruk realtime connection opened", category=LOG_CATEGORY_VENDOR
         )
         await self.on_connected()
+        await self._flush_buffered_audio()
+        self._flushing = False
+        self._ready_event.set()
         await self.send_connect_delay_metrics(
             int(
                 (asyncio.get_running_loop().time() - self._connect_started)
@@ -378,6 +451,7 @@ class OrukRealtimeASRExtension(AsyncASRBaseExtension, OrukRealtimeCallback):
     async def on_close(self, code: int, message: str) -> None:
         # Transport cleanup precedes callback delivery in the client.
         self.connection = None
+        self._ready_event.set()
         if not self._final_sent:
             self._emitted_ms += self._turn_duration_ms()
         await self._finish_finalize()

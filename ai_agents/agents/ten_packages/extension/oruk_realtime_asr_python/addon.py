@@ -11,4 +11,6 @@ from .extension import OrukRealtimeASRExtension
 class OrukRealtimeASRExtensionAddon(Addon):
     def on_create_instance(self, ten: TenEnv, addon_name: str, context) -> None:
         ten.log_info("on_create_instance")
-        ten.on_create_instance_done(OrukRealtimeASRExtension(addon_name), context)
+        ten.on_create_instance_done(
+            OrukRealtimeASRExtension(addon_name), context
+        )

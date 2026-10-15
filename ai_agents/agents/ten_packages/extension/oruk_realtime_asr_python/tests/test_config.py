@@ -44,7 +44,9 @@ def test_vendor_metadata_excludes_when_no_config():
 
 def test_vendor_metadata_includes_model_and_key():
     ext = OrukRealtimeASRExtension("test")
-    ext.config = OrukRealtimeASRConfig.model_validate({"params": {"key": "secret"}})
+    ext.config = OrukRealtimeASRConfig.model_validate(
+        {"params": {"key": "secret"}}
+    )
     md = ext.vendor_metadata()
     assert md["model"] == MODEL
     assert md["key"] == "secret"

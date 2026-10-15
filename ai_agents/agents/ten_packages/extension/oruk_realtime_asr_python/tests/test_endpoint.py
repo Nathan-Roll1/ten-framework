@@ -4,7 +4,9 @@ from ..recognition import validate_endpoint
 
 
 def test_accepts_default_wss():
-    validate_endpoint("wss://speech-api.oruk.ai/v1/realtime?model=oruk-realtime")
+    validate_endpoint(
+        "wss://speech-api.oruk.ai/v1/realtime?model=oruk-realtime"
+    )
 
 
 def test_rejects_non_wss():
